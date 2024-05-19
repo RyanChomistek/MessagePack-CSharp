@@ -7,10 +7,12 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Data;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 
 namespace MessagePackCompiler.CodeAnalysis
 {
@@ -29,8 +31,10 @@ namespace MessagePackCompiler.CodeAnalysis
         internal readonly INamedTypeSymbol? TaskOfT;
         internal readonly INamedTypeSymbol MessagePackObjectAttribute;
         internal readonly INamedTypeSymbol UnionAttribute;
+        internal readonly INamedTypeSymbol DynamicUnionAttribute;
         internal readonly INamedTypeSymbol SerializationConstructorAttribute;
         internal readonly INamedTypeSymbol KeyAttribute;
+        internal readonly INamedTypeSymbol DynamicKeyAttribute;
         internal readonly INamedTypeSymbol IgnoreAttribute;
         internal readonly INamedTypeSymbol? IgnoreDataMemberAttribute;
         internal readonly INamedTypeSymbol IMessagePackSerializationCallbackReceiver;
@@ -57,11 +61,17 @@ namespace MessagePackCompiler.CodeAnalysis
             UnionAttribute = compilation.GetTypeByMetadataName("MessagePack.UnionAttribute")
                 ?? throw new InvalidOperationException("failed to get metadata of MessagePack.UnionAttribute");
 
+            DynamicUnionAttribute = compilation.GetTypeByMetadataName("MessagePack.DynamicUnionAttribute")
+                ?? throw new InvalidOperationException("failed to get metadata of MessagePack.DynamicUnionAttribute");
+
             SerializationConstructorAttribute = compilation.GetTypeByMetadataName("MessagePack.SerializationConstructorAttribute")
                 ?? throw new InvalidOperationException("failed to get metadata of MessagePack.SerializationConstructorAttribute");
 
             KeyAttribute = compilation.GetTypeByMetadataName("MessagePack.KeyAttribute")
                 ?? throw new InvalidOperationException("failed to get metadata of MessagePack.KeyAttribute");
+
+            DynamicKeyAttribute = compilation.GetTypeByMetadataName("MessagePack.DynamicKeyAttribute")
+                ?? throw new InvalidOperationException("failed to get metadata of MessagePack.DynamicKeyAttribute");
 
             IgnoreAttribute = compilation.GetTypeByMetadataName("MessagePack.IgnoreMemberAttribute")
                 ?? throw new InvalidOperationException("failed to get metadata of MessagePack.IgnoreMemberAttribute");
@@ -370,8 +380,16 @@ namespace MessagePackCompiler.CodeAnalysis
                 return;
             }
 
+
             if (type.TypeKind == TypeKind.Interface || (type.TypeKind == TypeKind.Class && type.IsAbstract))
             {
+                Console.WriteLine($"type: {type.ToDisplayString()}, abstract {type.IsAbstract}");
+                if(type.GetAttributes().FirstOrDefault(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.DynamicUnionAttribute)) is not null)
+                {
+                    CollectDynamicUnion(type);
+                    return;
+                }
+
                 this.CollectUnion(type);
                 return;
             }
@@ -385,9 +403,40 @@ namespace MessagePackCompiler.CodeAnalysis
             this.collectedEnumInfo.Add(info);
         }
 
+        private void CollectDynamicUnion(INamedTypeSymbol type)
+        {
+            var data =
+                (from subType in targetTypes
+                 where compilation.ClassifyConversion(subType, type).IsImplicit
+                 where subType.GetAttributes().Any(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.MessagePackObjectAttribute))
+                 where !subType.ApproximatelyEqual(type)
+                 where !subType.IsGenericType
+                 where !subType.IsAbstract
+                 select subType).ToList();
+
+            UnionSubTypeInfo[] unionElements = new UnionSubTypeInfo[data.Count];
+            for (int i = 0; i < data.Count; i++)
+            {
+                unionElements[i] = new UnionSubTypeInfo(i, data[i].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat));
+            }
+
+            var info = new UnionSerializationInfo(
+                type.ContainingNamespace.IsGlobalNamespace ? null : type.ContainingNamespace.ToDisplayString(),
+                type.Name,
+                type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                unionElements);
+
+            this.collectedUnionInfo.Add(info);
+        }
+
         private void CollectUnion(INamedTypeSymbol type)
         {
-            ImmutableArray<TypedConstant>[] unionAttrs = type.GetAttributes().Where(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.UnionAttribute)).Select(x => x.ConstructorArguments).ToArray();
+            ImmutableArray<TypedConstant>[] unionAttrs =
+                type
+                .GetAttributes()
+                .Where(x =>
+                    x.AttributeClass.ApproximatelyEqual(this.typeReferences.UnionAttribute))
+                    .Select(x => x.ConstructorArguments).ToArray();
             if (unionAttrs.Length == 0)
             {
                 throw new MessagePackGeneratorResolveFailedException("Serialization Type must mark UnionAttribute." + " type: " + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat));
@@ -405,7 +454,11 @@ namespace MessagePackCompiler.CodeAnalysis
                 return new UnionSubTypeInfo(key, typeName);
             }
 
-            var info = new UnionSerializationInfo(type.ContainingNamespace.IsGlobalNamespace ? null : type.ContainingNamespace.ToDisplayString(), type.Name, type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), unionAttrs.Select(UnionSubTypeInfoSelector).OrderBy(x => x.Key).ToArray());
+            var info = new UnionSerializationInfo(
+                type.ContainingNamespace.IsGlobalNamespace ? null : type.ContainingNamespace.ToDisplayString(),
+                type.Name,
+                type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                unionAttrs.Select(UnionSubTypeInfoSelector).OrderBy(x => x.Key).ToArray());
 
             this.collectedUnionInfo.Add(info);
         }
@@ -562,10 +615,10 @@ namespace MessagePackCompiler.CodeAnalysis
             }
 
             // Collect substituted types for the type parameters (e.g. Bar in Foo<Bar>)
-            foreach (var item in type.TypeArguments)
-            {
-                this.CollectCore(item);
-            }
+            //foreach (var item in type.TypeArguments)
+            //{
+            //    this.CollectCore(item);
+            //}
 
             var formatterBuilder = new StringBuilder();
             if (!type.ContainingNamespace.IsGlobalNamespace)
@@ -599,6 +652,19 @@ namespace MessagePackCompiler.CodeAnalysis
         {
             ObjectSerializationInfo info = GetObjectInfo(type);
             collectedObjectInfo.Add(info);
+        }
+
+        private IEnumerable<ISymbol> GetFieldsAndProperties(INamedTypeSymbol type)
+        {
+            foreach (IPropertySymbol item in type.GetAllMembers().OfType<IPropertySymbol>())
+            {
+                yield return item;
+            }
+
+            foreach (IFieldSymbol item in type.GetAllMembers().OfType<IFieldSymbol>())
+            {
+                yield return item;
+            }
         }
 
         private ObjectSerializationInfo GetObjectInfo(INamedTypeSymbol type)
@@ -672,6 +738,22 @@ namespace MessagePackCompiler.CodeAnalysis
                 var searchFirst = true;
                 var hiddenIntKey = 0;
 
+                List<ISymbol> members = GetFieldsAndProperties(type).ToList();
+                Console.WriteLine($"members: {members.Count}");
+                var dynamicKeyMembers = members.Where(member =>
+                {
+                    return member
+                        .GetAttributes()
+                        .FirstOrDefault(x =>
+                            x.AttributeClass.ApproximatelyEqual(this.typeReferences.DynamicKeyAttribute)) is not null;
+                }).ToList();
+
+                Console.WriteLine($"dynamic keys: {dynamicKeyMembers.Count}");
+                foreach ( var dynamicMember in dynamicKeyMembers )
+                {
+                    Console.WriteLine($"dynamic key: {dynamicMember.ToDisplayString()}");
+                }
+
                 foreach (IPropertySymbol item in type.GetAllMembers().OfType<IPropertySymbol>())
                 {
                     if (item.IsIndexer)
@@ -696,11 +778,23 @@ namespace MessagePackCompiler.CodeAnalysis
                     }
 
                     var customFormatterAttr = item.GetAttributes().FirstOrDefault(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.MessagePackFormatterAttribute))?.ConstructorArguments[0].Value as INamedTypeSymbol;
-                    var key = item.GetAttributes().FirstOrDefault(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.KeyAttribute))?.ConstructorArguments[0]
+
+                    int? intKey = null;
+                    string? stringKey = null;
+                    var dynamicKey = item.GetAttributes().FirstOrDefault(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.DynamicKeyAttribute));
+                    if (dynamicKey is not null)
+                    {
+                        intKey = dynamicKeyMembers.IndexOf(item);
+                    }
+                    else
+                    {
+                        var key = item.GetAttributes().FirstOrDefault(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.KeyAttribute))?.ConstructorArguments[0]
                               ?? throw new MessagePackGeneratorResolveFailedException("all public members must mark KeyAttribute or IgnoreMemberAttribute." + " type: " + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) + " member:" + item.Name);
 
-                    var intKey = key is { Value: int intKeyValue } ? intKeyValue : default(int?);
-                    var stringKey = key is { Value: string stringKeyValue } ? stringKeyValue : default;
+                        intKey = key is { Value: int intKeyValue } ? intKeyValue : default(int?);
+                        stringKey = key is { Value: string stringKeyValue } ? stringKeyValue : default;
+                    }
+
                     if (intKey == null && stringKey == null)
                     {
                         throw new MessagePackGeneratorResolveFailedException("both IntKey and StringKey are null." + " type: " + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) + " member:" + item.Name);
@@ -768,11 +862,25 @@ namespace MessagePackCompiler.CodeAnalysis
                     }
 
                     var customFormatterAttr = item.GetAttributes().FirstOrDefault(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.MessagePackFormatterAttribute))?.ConstructorArguments[0].Value as INamedTypeSymbol;
-                    var key = item.GetAttributes().FirstOrDefault(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.KeyAttribute))?.ConstructorArguments[0]
-                              ?? throw new MessagePackGeneratorResolveFailedException("all public members must mark KeyAttribute or IgnoreMemberAttribute." + " type: " + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) + " member:" + item.Name);
 
-                    var intKey = key is { Value: int intKeyValue } ? intKeyValue : default(int?);
-                    var stringKey = key is { Value: string stringKeyValue } ? stringKeyValue : default;
+                    int? intKey = null;
+                    string? stringKey = null;
+
+                    var dynamicKey = item.GetAttributes().FirstOrDefault(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.DynamicKeyAttribute));
+
+                    if (dynamicKey is not null)
+                    {
+                        intKey = dynamicKeyMembers.IndexOf(item);
+                    }
+                    else
+                    {
+                        var key = item.GetAttributes().FirstOrDefault(x => x.AttributeClass.ApproximatelyEqual(this.typeReferences.KeyAttribute))?.ConstructorArguments[0]
+                            ?? throw new MessagePackGeneratorResolveFailedException("all public members must mark KeyAttribute or IgnoreMemberAttribute." + " type: " + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) + " member:" + item.Name);
+
+                        intKey = key is { Value: int intKeyValue } ? intKeyValue : default(int?);
+                        stringKey = key is { Value: string stringKeyValue } ? stringKeyValue : default;
+                    }
+
                     if (intKey == null && stringKey == null)
                     {
                         throw new MessagePackGeneratorResolveFailedException("both IntKey and StringKey are null." + " type: " + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) + " member:" + item.Name);
@@ -818,10 +926,12 @@ namespace MessagePackCompiler.CodeAnalysis
 
             // GetConstructor
             var ctorEnumerator = default(IEnumerator<IMethodSymbol>);
-            var ctor = type.Constructors.Where(x => x.DeclaredAccessibility == Accessibility.Public).SingleOrDefault(x => x.GetAttributes().Any(y => y.AttributeClass != null && y.AttributeClass.ApproximatelyEqual(this.typeReferences.SerializationConstructorAttribute)));
+            var ctor = type.Constructors
+                .SingleOrDefault(x =>
+                    x.GetAttributes().Any(y => y.AttributeClass != null && y.AttributeClass.ApproximatelyEqual(this.typeReferences.SerializationConstructorAttribute)));
             if (ctor == null)
             {
-                ctorEnumerator = type.Constructors.Where(x => x.DeclaredAccessibility == Accessibility.Public).OrderByDescending(x => x.Parameters.Length).GetEnumerator();
+                ctorEnumerator = type.Constructors.OrderByDescending(x => x.Parameters.Length).GetEnumerator();
 
                 if (ctorEnumerator.MoveNext())
                 {
@@ -843,6 +953,12 @@ namespace MessagePackCompiler.CodeAnalysis
                 {
                     constructorParameters.Clear();
                     var ctorParamIndex = 0;
+
+                    if (ctor!.GetAttributes().Any(y => y.AttributeClass != null && y.AttributeClass.ApproximatelyEqual(this.typeReferences.SerializationConstructorAttribute)))
+                    {
+                        break;
+                    }
+
                     foreach (IParameterSymbol item in ctor!.Parameters)
                     {
                         MemberSerializationInfo paramMember;
@@ -948,7 +1064,19 @@ namespace MessagePackCompiler.CodeAnalysis
                 needsCastOnAfter = !type.GetMembers("OnAfterDeserialize").Any();
             }
 
-            var info = new ObjectSerializationInfo(isClass, isOpenGenericType, isOpenGenericType ? type.TypeParameters.Select(ToGenericTypeParameterInfo).ToArray() : Array.Empty<GenericTypeParameterInfo>(), constructorParameters.ToArray(), isIntKey, isIntKey ? intMembers.Values.ToArray() : stringMembers.Values.ToArray(), isOpenGenericType ? GetGenericFormatterClassName(type) : GetMinimallyQualifiedClassName(type), type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), type.ContainingNamespace.IsGlobalNamespace ? null : type.ContainingNamespace.ToDisplayString(), hasSerializationConstructor, needsCastOnAfter, needsCastOnBefore);
+            var info = new ObjectSerializationInfo(
+                isClass,
+                isOpenGenericType,
+                isOpenGenericType ? type.TypeParameters.Select(ToGenericTypeParameterInfo).ToArray() : Array.Empty<GenericTypeParameterInfo>(),
+                constructorParameters.ToArray(),
+                isIntKey,
+                isIntKey ? intMembers.Values.ToArray() : stringMembers.Values.ToArray(),
+                isOpenGenericType ? GetGenericFormatterClassName(type) : GetMinimallyQualifiedClassName(type),
+                type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                type.ContainingNamespace.IsGlobalNamespace ? null : type.ContainingNamespace.ToDisplayString(),
+                hasSerializationConstructor,
+                needsCastOnAfter,
+                needsCastOnBefore);
 
             return info;
         }

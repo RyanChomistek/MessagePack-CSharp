@@ -103,9 +103,19 @@ namespace MessagePack.Resolvers
         private static TypeInfo? BuildType(Type type)
         {
             TypeInfo ti = type.GetTypeInfo();
+            UnionAttribute[] unionAttrs;
 
-            // order by key(important for use jump-table of switch)
-            UnionAttribute[] unionAttrs = ti.GetCustomAttributes<UnionAttribute>().OrderBy(x => x.Key).ToArray();
+            DynamicUnionAttribute dynamicUnionAttribute = ti.GetCustomAttribute<DynamicUnionAttribute>();
+
+            if (dynamicUnionAttribute != null)
+            {
+                unionAttrs = dynamicUnionAttribute.GetUnionedTypes(type);
+            }
+            else
+            {
+                // order by key(important for use jump-table of switch)
+                unionAttrs = ti.GetCustomAttributes<UnionAttribute>().OrderBy(x => x.Key).ToArray();
+            }
 
             if (unionAttrs.Length == 0)
             {

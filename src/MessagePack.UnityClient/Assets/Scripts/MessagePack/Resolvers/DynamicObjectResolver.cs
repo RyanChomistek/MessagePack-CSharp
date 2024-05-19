@@ -1874,12 +1874,22 @@ namespace MessagePack.Internal
                     KeyAttribute key;
                     if (contractAttr != null)
                     {
-                        // MessagePackObjectAttribute. KeyAttribute must be marked, and IntKey or StringKey must be set.
-                        key = memberInfo.GetCustomAttribute<KeyAttribute>(true) ??
-                            throw new MessagePackDynamicObjectResolverException($"all public members must mark KeyAttribute or IgnoreMemberAttribute. type:{type.FullName} member:{memberInfo.Name}");
-                        if (key.IntKey == null && key.StringKey == null)
+                        var dynamicKey = memberInfo.GetCustomAttribute<DynamicKeyAttribute>(true);
+                        if (dynamicKey != null)
                         {
-                            throw new MessagePackDynamicObjectResolverException($"both IntKey and StringKey are null. type: {type.FullName} member:{memberInfo.Name}");
+                            dynamicKey.GetKey(type, memberInfo);
+                            key = new KeyAttribute(dynamicKey.IntKey.Value);
+                        }
+                        else
+                        {
+                            // MessagePackObjectAttribute. KeyAttribute must be marked, and IntKey or StringKey must be set.
+                            key = memberInfo.GetCustomAttribute<KeyAttribute>(true) ??
+                            throw new MessagePackDynamicObjectResolverException($"all public members must mark KeyAttribute or IgnoreMemberAttribute. type:{type.FullName} member:{memberInfo.Name}");
+
+                            if (key.IntKey == null && key.StringKey == null)
+                            {
+                                throw new MessagePackDynamicObjectResolverException($"both IntKey and StringKey are null. type: {type.FullName} member:{memberInfo.Name}");
+                            }
                         }
                     }
                     else
